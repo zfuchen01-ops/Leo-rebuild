@@ -1,0 +1,19 @@
+﻿{
+    "finished_at":  "2026-06-07T15:28:47",
+    "status":  "complete",
+    "groups":  [
+                   "A/RS",
+                   "B/RS",
+                   "A/MGCS",
+                   "B/MGCS"
+               ],
+    "full400_groups":  [
+                           "A/RS",
+                           "B/RS",
+                           "A/MGCS",
+                           "B/MGCS"
+                       ],
+    "b_mgcs_reused_result":  "results\\final_calibrated_pathaware_fig4_B_full400_4methods.csv",
+    "b_mgcs_reuse_reason":  "Configuration and metadata match the screened B/MGCS baseline.",
+    "report":  "results\\overnight_handover_screen\\acceptance_report_zh.md"
+}

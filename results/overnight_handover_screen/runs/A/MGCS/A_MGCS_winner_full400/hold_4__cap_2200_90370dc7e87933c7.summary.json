@@ -1,0 +1,18 @@
+{
+  "method": "MGCS",
+  "constellation": "A",
+  "candidate": "hold_4__cap_2200",
+  "result_csv": "F:\\human_work_area\\work_1\\_src_unpacked\\results\\overnight_handover_screen\\runs\\A\\MGCS\\A_MGCS_winner_full400\\hold_4__cap_2200_90370dc7e87933c7.csv",
+  "env_json": "{\"LEO_CHANNEL_QUALITY_MIN_HOLD_SLOTS\": \"4\", \"LEO_CHANNEL_QUALITY_MIN_HOLD_SLOTS_POINTS\": \"\", \"LEO_GSL_RATE_CAP_POINTS\": \"100:500,350:1000,600:2200\"}",
+  "throughput_mean": 0.03891303514860172,
+  "throughput_max": 0.08168183224115344,
+  "delay_mean": 0.11498680108042246,
+  "delay_max": 0.12446731588442796,
+  "handover_mean": 0.07452632985701155,
+  "handover_max": 0.10199999999999976,
+  "score": 0.07598048281151187,
+  "stage": "A_MGCS_winner_full400",
+  "slots": 400,
+  "users": "100 150 200 250 300 350 400 450 500 550 600",
+  "config_key": "90370dc7e87933c7"
+}
