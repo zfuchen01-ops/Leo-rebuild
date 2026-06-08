@@ -802,18 +802,33 @@ class Handover:
         for u in self.topo.user:
             if u.user_ID > len(self.topo.user)/2:
                 break
-            for user in u.user_to_connect_to:
-                if user.sat_connected!=None:
-                    temp_sat = Satellite()
-                    temp_sat = user.sat_connected
-                    if u.sat_connected!=temp_sat:
-                        isl_distance += self.Calc_Path_Distance(u.sat_connected, temp_sat)
+            gw = getattr(u, 'assigned_gateway', None)
+            if gw is not None and gw.connected_sat[0] is not None:
+                # 走 gateway 落地路径
+                feeder_sat = gw.connected_sat[0]
+                if u.sat_connected is not None:
+                    if u.sat_connected != feeder_sat:
+                        isl_distance += self.Calc_Path_Distance(u.sat_connected, feeder_sat)
                         legacy_hop_isl_distance += (
-                            self.Calc_Path_Hops(u.sat_connected, temp_sat) * length_per_hop
+                            self.Calc_Path_Hops(u.sat_connected, feeder_sat) * length_per_hop
                         )
-                    source_gsl_distance += Calc_Sphere_Distance(u.we_pos,u.sat_connected.we_pos)
-                    destination_gsl_distance += Calc_Sphere_Distance(user.we_pos,user.sat_connected.we_pos)
-                    count = count + 1
+                    source_gsl_distance += Calc_Sphere_Distance(u.we_pos, u.sat_connected.we_pos)
+                    destination_gsl_distance += Calc_Sphere_Distance(gw.we_pos, feeder_sat.we_pos)
+                    count += 1
+            else:
+                # 原有逻辑: user-to-user path
+                for user in u.user_to_connect_to:
+                    if user.sat_connected!=None:
+                        temp_sat = Satellite()
+                        temp_sat = user.sat_connected
+                        if u.sat_connected!=temp_sat:
+                            isl_distance += self.Calc_Path_Distance(u.sat_connected, temp_sat)
+                            legacy_hop_isl_distance += (
+                                self.Calc_Path_Hops(u.sat_connected, temp_sat) * length_per_hop
+                            )
+                        source_gsl_distance += Calc_Sphere_Distance(u.we_pos,u.sat_connected.we_pos)
+                        destination_gsl_distance += Calc_Sphere_Distance(user.we_pos,user.sat_connected.we_pos)
+                        count = count + 1
         return delay_components_ms(
             source_gsl_distance,
             isl_distance,
@@ -932,11 +947,28 @@ class Handover:
             self.Trig_Handover(self.topo.satellite[actions[user]-1],user,mode)
 
     def Get_Reward(self, user:User):
+        """论文奖励: w1*rate + w2*hops + w3*handover_cost (0.6, 0.2, 0.2)"""
         reward = 0.0
-        if user.sat_connected!=None:
-            reward = self.ho[user][user.sat_connected].available_band 
-            if user.sat_connected!=user.last_connected:
-                reward -= HANDOVER_COST
+        if user.sat_connected is not None:
+            # 传输速率: 已分配带宽 (Mbps), 归一化到[0,1]
+            rate = 0.0
+            for dest, bw in user.allocate_band.items():
+                rate += bw
+            rate_norm = rate / 500.0  # 500Mbps 上限
+            # 路径跳数: 取负数, 跳数越少越好
+            hops = 1.0
+            gw = getattr(user, 'assigned_gateway', None)
+            if gw is not None and gw.connected_sat[0] is not None:
+                feeder = gw.connected_sat[0]
+                if user.sat_connected != feeder:
+                    hops = max(1.0, self.Calc_Path_Hops(user.sat_connected, feeder))
+            hops_norm = 1.0 / hops  # 归一化到 (0,1]
+            # 切换开销: 切换时惩罚
+            ho_cost = 0.0
+            if user.sat_connected != user.last_connected:
+                ho_cost = -0.2
+            # 论文权重: w1=0.6, w2=0.2, w3=0.2
+            reward = 0.6 * rate_norm + 0.2 * hops_norm + 0.2 * ho_cost
         return reward
     
     #RL

@@ -103,7 +103,7 @@ class Q_net(nn.Module):
             return torch.zeros([1, 1, self.hidden_size]), torch.zeros([1, 1, self.hidden_size])
 
 class UserAgent:
-    def __init__(self, user:User, env:Handover, c_agent, gamma=0.9, epsilon=0.01, batch=1024, buffer=1000, hidden_size=64, seq=1,device='auto'):
+    def __init__(self, user:User, env:Handover, c_agent, gamma=0.9, epsilon=0.01, batch=256, buffer=2000, hidden_size=64, seq=6, device='auto'):
         self.action_n = env.topo.total_sat
         self.gamma = gamma
         self.epsilon = epsilon
@@ -162,7 +162,7 @@ class UserAgent:
     
 
 class CenterAgent:
-    def __init__(self, env:Handover, gamma=0.9, epsilon=0.01, batch=1024, buffer=100000, hidden_size=64, lr=0.001, seq=1,device='auto'):
+    def __init__(self, env:Handover, gamma=0.9, epsilon=0.01, batch=256, buffer=20000, hidden_size=64, lr=0.001, seq=6, device='auto'):
         self.action_n = env.topo.total_sat
         self.gamma = gamma
         self.epsilon = epsilon
@@ -205,7 +205,7 @@ class CenterAgent:
     def save_net(self, PATH):
         torch.save(self.evaluate_net, PATH)
 
-def train_episode(env:Handover, u_agents, c_agent, model, mode=None,start_time=0, end_time=250000, time_step=50, net_step=10,batch=1024):
+def train_episode(env:Handover, u_agents, c_agent, model, mode=None,start_time=0, end_time=250000, time_step=50, net_step=20,batch=256):
     total_reward = 0.0  #训练阶段总回报
     reward_list = []
     time = start_time   #当前训练时刻

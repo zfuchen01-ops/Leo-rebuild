@@ -2,6 +2,7 @@ from Constellation import Constellation
 from Defination import *
 from Position import Convert_PI_to_Angle,Calc_Sphere_Elevation
 from User import User
+from Gateway import Gateway
 from random import uniform
 import os
 
@@ -21,6 +22,7 @@ class Topology:
         self.current_time = 0   #当前拓扑时刻
         self.constellation = [] #星座
         self.user = []
+        self.gateway = []
         self.satellite = []
 
     #添加一整个星座
@@ -42,6 +44,8 @@ class Topology:
     def Update_Topology_Status(self, time):
         self.Update_Sat_Coord(time)
         self.Update_Coverage()
+        self.update_gateway_Coverage()
+        self.update_feederlink()
         self.Record_Sat_Coord()
         self.Record_User_Coverage()
 
@@ -132,3 +136,55 @@ class Topology:
                 print("Wrong location array")
                 exit
             self.Add_User_Loc(coord[0],coord[1])
+
+    # --- 地面站相关方法 ---
+
+    def Add_Gateway_Loc(self, lon, lat, antenna_Num=1, name_str=""):
+        gw = Gateway(lon, lat, antenna_Num, name_str)
+        self.gateway.append(gw)
+
+    def update_gateway_Coverage(self):
+        """更新每个地面站被哪些卫星覆盖"""
+        for gw in self.gateway:
+            gw.sat_covered.clear()
+            for con in self.constellation:
+                for orbit in con.orbit_sat:
+                    for sat in orbit.sat_in_orbit:
+                        elevation = Calc_Sphere_Elevation(sat.we_pos, gw.we_pos)
+                        if elevation >= GATEWAY_ELEVATION:
+                            gw.sat_covered.add(sat)
+
+    def update_feederlink(self):
+        """地面站馈电链路切换: 每次选择剩余可见时长最大的卫星 (博士论文策略)"""
+        for gw in self.gateway:
+            for ant in range(gw.antenna_Num):
+                # 若当前卫星仍在覆盖范围内则保持不变
+                curr = gw.connected_sat[ant]
+                if curr is not None and curr in gw.sat_covered:
+                    continue
+                # 否则选剩余服务时间最长的可见卫星
+                best_sat = None
+                best_time = -1.0
+                for sat in gw.sat_covered:
+                    s_time = self._calc_service_time(sat, gw)
+                    if s_time > best_time:
+                        best_time = s_time
+                        best_sat = sat
+                # 断开旧连接
+                if curr is not None and gw in curr.connected_gateway:
+                    curr.connected_gateway.remove(gw)
+                # 建立新连接
+                if best_sat is not None:
+                    best_sat.connected_gateway.append(gw)
+                gw.connected_sat[ant] = best_sat
+
+    def _calc_service_time(self, sat, gw):
+        """估算卫星对地面站的剩余可见时间 (弧度制距离)"""
+        from math import acos, cos, sin
+        from Position import Calc_Sphere_Distance
+        # 近似: 当前可见距离 vs 最大可见距离 的比例
+        dist = Calc_Sphere_Distance(sat.we_pos, gw.we_pos)
+        max_dist = acos(EARTH_RADIUS / (EARTH_RADIUS + SAT_HEIGHT)) * (EARTH_RADIUS + SAT_HEIGHT)
+        if dist >= max_dist:
+            return 0.0
+        return max_dist - dist

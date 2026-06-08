@@ -21,6 +21,7 @@ class User:
         self.we_pos = Sphere_Position()
         self.we_pos = self.w0_pos
         self.vel = 0.0
+        self.assigned_gateway = None    # 分配的回落地面站
         self.elevation = elevation
         self.beam = beam
         self.sat_covered = set()

@@ -60,5 +60,10 @@ LIGHT_LOAD_USER_THRESHOLD = int(os.environ.get(
 
 # 调试参数
 TOPO_LOG_LEVEL = 4        # 是否输出log文件
-NET_LOG_LEVEL = 6         # 
-HO_LOG_LEVEL = 2    
+NET_LOG_LEVEL = 6         #
+HO_LOG_LEVEL = 2
+
+# 地面站参数
+GATEWAY_ELEVATION = pi/180.0 * 5     # 地面站最小仰角
+FEEDLINK_CAPACITY = 500              # 单天线馈电容量 (Mbps), 论文未明确，按保守值
+ISL_CAPACITY = 2500                  # 星间链路容量 (Mbps), 博士论文表3-1 C_s=2.5Gbps

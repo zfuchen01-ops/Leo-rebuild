@@ -13,6 +13,7 @@ class Satellite:
         self.original_phi = 0.0         #初始位置的轨道内相位
         self.isNorth = True
         self.user_connected = set()        #连接的用户
+        self.connected_gateway = []        #连接的地面站(天线)
         self.my_ob = Orbit_Info()       #轨道参数
         self.wi_pos = Sphere_Position() #轨道面坐标系
         self.w0_pos = Sphere_Position() #静止地球坐标系（忽略自转）

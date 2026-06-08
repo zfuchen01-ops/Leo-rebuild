@@ -191,10 +191,44 @@ def build_env(user_count: int, constellation: str, traffic_mode: str, gateway_co
     reset_ids()
     topo = Topology()
     make_constellation(topo, constellation)
-    topo.Add_User_From_Input(make_user_locations(user_count, traffic_mode, gateway_count))
-    half = len(topo.user) // 2
-    for i in range(half):
-        topo.user[i].User_Connect_User(topo.user[i + half], "UPLOAD")
+
+    # 添加地面站 (博士论文: 6个, 对应6个回传目的地)
+    from math import pi as _pi
+    gw_coords = [
+        (130.361634, 46.809606, "佳木斯"),
+        (86.15528, 41.76602, "库尔勒"),
+        (110.47, 19.938, "文昌"),
+        (108.963122, 34.90892, "铜川"),
+        (116.397128, 39.916527, "雄安"),
+        (75.944, 39.468, "喀什"),
+    ]
+    for lon_deg, lat_deg, name in gw_coords:
+        topo.Add_Gateway_Loc(
+            lon_deg / 180.0 * _pi,
+            lat_deg / 180.0 * _pi,
+            antenna_Num=1,
+            name_str=name,
+        )
+
+    # 添加用户 (全部为源终端, 不需要fake gateway)
+    all_users = make_user_locations(user_count, traffic_mode, gateway_count)
+    # 如果 ground_backbone 模式且 ground station 未被禁用, 只取source部分
+    if traffic_mode == "ground_backbone":
+        half = user_count // 2
+        source_locations = all_users[:half]  # 只取源终端
+    else:
+        source_locations = all_users
+    topo.Add_User_From_Input(source_locations)
+
+    # 每个用户分配一个地面站 (轮询)
+    for i, user in enumerate(topo.user):
+        user.assigned_gateway = topo.gateway[i % len(topo.gateway)]
+
+    # 用户两两配对(保持源-目的配对结构, 但实际路由走gateway)
+    half_u = len(topo.user) // 2
+    for i in range(half_u):
+        topo.user[i].User_Connect_User(topo.user[i + half_u], "UPLOAD")
+
     return PaperRebuildHandover(net=Network(topo))
 
 
