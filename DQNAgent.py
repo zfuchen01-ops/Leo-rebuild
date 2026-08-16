@@ -49,7 +49,7 @@ class UserAgent:
         self.epsilon = epsilon
         self.batch_size = batch
         self.device = resolve_device(device)
-        self.evaluate_net = self.build_net(input_size=3*self.action_n,   #第一维的数量，即行数
+        self.evaluate_net = self.build_net(input_size=4*self.action_n + 1,   #第一维的数量，即行数
             hidden_sizes=hidden_sizes, output_size=self.action_n).to(self.device)
         self.user = user
         self.c_agent = c_agent
@@ -111,7 +111,7 @@ class CenterAgent:
         self.batch_size = batch
         self.device = resolve_device(device)
         self.replayer = DQNReplayer(buffer)
-        self.evaluate_net = self.build_net(input_size=3*self.action_n,   #第一维的数量，即行数
+        self.evaluate_net = self.build_net(input_size=4*self.action_n + 1,   #第一维的数量，即行数
             hidden_sizes=hidden_sizes, output_size=self.action_n).to(self.device)
         self.optimizer = optim.Adam(self.evaluate_net.parameters(), lr=lr)   #Adam包括偏置修正，修正从原点初始化的一阶矩（动量项）和（非中心的）二阶矩估计
         self.loss = nn.MSELoss()    #均方损失函数

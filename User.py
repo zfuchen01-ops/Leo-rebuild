@@ -31,7 +31,8 @@ class User:
         self.user_connecting_by = set()     #处于连接中的终端，该终端为目的
         self.user_to_connect_to = {}        #期望上行吞吐量，即星地信道容量
         self.user_to_connect_by = {}        #期望下行吞吐量，即星地信道容量
-        self.allocate_band = {}     #网络中分配的带宽
+        self.allocate_band = {}     #网络中分配的带宽: {dest_user: bandwidth}
+        self.allocate_dest = {}     #分配时的目的卫星ID: {dest_user: sat_id}
     
     def __hash__(self):
         return hash(self.user_ID)

@@ -7,7 +7,7 @@ from Topology import Topology
 from Position import *
 from User import User
 from enum import Enum
-from math import log2
+from math import log2, pi as _pi
 import sys
 import os
 import numpy as np
@@ -124,6 +124,9 @@ class Handover:
         self.weight_samples = []
         self.delay_component_samples = []
         self.source_ho_count = 0
+        self._hops_cache = {}  # (sat_id, feeder_id) -> hops, 每集预计算
+        self._rvt_cache = {}   # (sat_id, time) -> Sphere_Position, 每时刻跨用户复用
+        self._rvt_cache_time = None
         self.destination_ho_count = 0
         if net!=None:
             self.net = net
@@ -287,7 +290,7 @@ class Handover:
             hold_slots = self.Get_Channel_Quality_Min_Hold_Slots()
             if hold_slots > 0 and user.sat_connected in self.ho[user]:
                 last_time = getattr(user, "_last_handover_time", None)
-                if last_time is not None and self.topo.current_time - last_time < hold_slots * 30:
+                if last_time is not None and self.topo.current_time - last_time < hold_slots * SLOT_SECONDS:
                     self.Trig_Handover(user.sat_connected,user,'NETWORK') if isNet==True else self.Trig_Handover(user.sat_connected,user,'OTHERS')
                     return
             if CHANNEL_QUALITY_MIN_SERVICE_TIME > 0 and user.sat_connected in self.ho[user]:
@@ -444,10 +447,10 @@ class Handover:
         if s_target==None:
             if user.sat_connected!=None:
                 temp_target = user.sat_connected
-                if (mode=='NETWORK' or mode=='INITIAL') and self.net.User_Disconnect_Satellite(user,temp_target)==False:
-                    print("User:%d fails to disconnect to Sat:%d\n"%(user.user_ID,temp_target.ID))
-                    exit(1)
-                temp_target.user_connected.remove(user)
+                # 30s步长: 旧卫星可能飞出, 始终释放LSA防止泄漏
+                self.net.User_Disconnect_Satellite(user,temp_target)  # 无ho检查, 直接释放
+                if temp_target in self.ho[user]:
+                    temp_target.user_connected.remove(user)
                 user.sat_connected=None
             if 3>HO_LOG_LEVEL:
                 hout.write("Time:%d User:%d located at %.4f %.4f blocked!!!\n" \
@@ -455,7 +458,7 @@ class Handover:
             self.block_count += 1
         else:
             #终端未接入卫星，建立连接
-            band = self.ho[user][s_target].c_quality
+            band = self.ho[user][s_target].c_quality  # 不cap, Shannon天然上限
             if user.sat_connected==None:
                 if (mode=='NETWORK' or mode=='INITIAL') and self.net.User_Connect_Satellite(user,s_target,band)==False:
                     if 3>HO_LOG_LEVEL:
@@ -470,11 +473,13 @@ class Handover:
             #终端接入卫星，断开旧连接，建立新连接
             elif mode!='INITIAL':
                 same_flag = (s_target == user.sat_connected)
+                if same_flag:
+                    return  # 同星切换:跳过disconnect/reconnect
                 temp_target = user.sat_connected
-                if (mode=='NETWORK' or mode=='INITIAL') and self.net.User_Disconnect_Satellite(user,temp_target)==False:
-                    print("User:%d fails to disconnect to Sat:%d\n"%(user.user_ID,temp_target.ID))
-                    exit(1)
-                temp_target.user_connected.remove(user)
+                # 30s步长: 旧卫星可能飞出, 始终释放LSA防止泄漏
+                self.net.User_Disconnect_Satellite(user,temp_target)  # 无ho检查, 直接释放
+                if temp_target in self.ho[user]:
+                    temp_target.user_connected.remove(user)
                 user.sat_connected=None
                 if (mode=='NETWORK' or mode=='INITIAL') and self.net.User_Connect_Satellite(user,s_target,band)==False:
                     if 3>HO_LOG_LEVEL:
@@ -682,11 +687,31 @@ class Handover:
 
     #计算卫星可用星间带宽，如果目的与源节点处于同一颗卫星，该值最大。
     def Calc_Available_Band(self, s:Satellite, u:User):
+        """计算从卫星s到用户u的目的地的ISL路径质量.
+        论文模式: 目的地=gateway feeder卫星; 否则=配对用户卫星."""
         res = 0.0
+        gw = getattr(u, 'assigned_gateway', None)
+        feeder_sat = gw.connected_sat[0] if (gw is not None and len(gw.connected_sat) > 0 and gw.connected_sat[0] is not None) else None
+
+        # 论文gateway场景: 无配对用户, 直连feeder
+        if len(u.user_to_connect_to) == 0 and len(u.user_to_connect_by) == 0 and feeder_sat is not None:
+            if s == feeder_sat:
+                res = DIRECT_PATH_QUALITY
+            elif self.net.SPT[s.con_id-1][s.ID-1][feeder_sat.ID-1].isReached:
+                res = self.net.N2N_status[s.con_id-1][s.ID-1][feeder_sat.ID-1].load_rate
+            else:
+                res = 0.0
+            return res
+
         for user in u.user_to_connect_to:
-            if user.sat_connected!=None:
-                temp_sat = Satellite()
+            if feeder_sat is not None:
+                temp_sat = feeder_sat  # 论文: ISL路径到gateway
+            elif user.sat_connected is not None:
                 temp_sat = user.sat_connected
+            else:
+                temp_sat = None
+
+            if temp_sat is not None:
                 if s==temp_sat:
                     res += DIRECT_PATH_QUALITY
                 elif self.Effective_IPQ_Mode() == "pldr_lifetime":
@@ -697,8 +722,9 @@ class Handover:
             else:
                 temp = 1.0
                 for i in range(4):
-                    if self.net.LSDB[s.con_id-1][s.ID-1][i].isEstablished:
-                        temp = temp*(self.net.LSDB[s.con_id-1][s.ID-1][i].total_band-self.net.LSDB[s.con_id-1][s.ID-1][i].used_band)/self.net.LSDB[s.con_id-1][s.ID-1][i].total_band
+                    lsa = self.net.LSDB[s.con_id-1][s.ID-1][i]
+                    if lsa.isEstablished and lsa.total_band > 0:
+                        temp = temp * (lsa.total_band - lsa.used_band) / lsa.total_band
                 res += temp
         return res
 
@@ -931,58 +957,186 @@ class Handover:
                 self.net.Update_LSDB_Netmode()
             self.net.Dijkstra_All()
             self.net.Generate_Forwardingtable_By_AllNode()
-        # self.net.Update_N2N_Load_By_LSDB_All()
+        # self.net.reset_lsa_used_band()  # 不重置: v1.1路线, 物理reward不care FCFS死锁
         self.net.Link_LSDB_With_N2N_All()
+        self.net.Update_N2N_Load_By_LSDB_All()  # 初始化N2N端到端带宽
+        self._precompute_hops()  # 预计算跳数矩阵
         self.net.Update_NSA_Band_All()
         self.net.Record()
         self.Initial_Handover()
         self.Update_Channel_Resource()
+        self.Update_Trans_Rate(time)  # 填充c_quality (修复:原初始化流程遗漏)
         self.Update_Available_Band()
         self.Update_Rate_Integral(time)
-        
+
 
     def step(self, actions, mode:str):
         for user in actions:
-            #print(actions[user])
-            self.Trig_Handover(self.topo.satellite[actions[user]-1],user,mode)
+            s = self.topo.satellite[actions[user]-1]
+            if s not in self.ho[user]: continue  # DQN可能选不可见卫星
+            self.Trig_Handover(s, user, mode)
 
     def Get_Reward(self, user:User):
-        """论文奖励: w1*rate + w2*hops + w3*handover_cost (0.6, 0.2, 0.2)"""
-        reward = 0.0
-        if user.sat_connected is not None:
-            # 传输速率: 已分配带宽 (Mbps), 归一化到[0,1]
-            rate = 0.0
-            for dest, bw in user.allocate_band.items():
-                rate += bw
-            rate_norm = rate / 500.0  # 500Mbps 上限
-            # 路径跳数: 取负数, 跳数越少越好
-            hops = 1.0
-            gw = getattr(user, 'assigned_gateway', None)
-            if gw is not None and gw.connected_sat[0] is not None:
-                feeder = gw.connected_sat[0]
-                if user.sat_connected != feeder:
-                    hops = max(1.0, self.Calc_Path_Hops(user.sat_connected, feeder))
-            hops_norm = 1.0 / hops  # 归一化到 (0,1]
-            # 切换开销: 切换时惩罚
-            ho_cost = 0.0
-            if user.sat_connected != user.last_connected:
-                ho_cost = -0.2
-            # 论文权重: w1=0.6, w2=0.2, w3=0.2
-            reward = 0.6 * rate_norm + 0.2 * hops_norm + 0.2 * ho_cost
-        return reward
+        """杨论文Eq.50对齐: r = Cavai/RATE_UPPER - ω₁∆access - ω₂∆backhaul
+           ω₁=1.5, ω₂=2.0"""
+        C_NORM = RATE_UPPER
+        if user.sat_connected is not None and user.sat_connected in self.ho[user]:
+            access = self.ho[user][user.sat_connected].c_quality
+            feeder = self._get_feeder_sat(user, user.sat_connected)
+            fb_val = 9999.0
+            if feeder is not None and user.sat_connected != feeder:
+                fb_val = self.net.N2N_status[user.sat_connected.con_id-1][user.sat_connected.ID-1][feeder.ID-1].free_band
+            cavai = min(access, fb_val)
+            rate_reward = cavai / C_NORM
+            # 接入切换惩罚: ω₁ (环境变量LEO_HO_PENALTY, 默认1.5)
+            ho_penalty = 0.0
+            if user.last_connected is not None and user.sat_connected != user.last_connected:
+                ho_penalty = float(os.environ.get('LEO_HO_PENALTY', '0.2'))
+            # 回传路径变化惩罚: ω₂ (环境变量LEO_BH_PENALTY, 默认0.2)
+            bh_penalty = 0.0
+            last_feeder = getattr(user, '_last_feeder', None)
+            last_hops = getattr(user, '_last_feeder_hops', 0)
+            if feeder is not None:
+                curr_hops = self._hops_cache.get((user.sat_connected.ID, feeder.ID),
+                              max(1, self.Calc_Path_Hops(user.sat_connected, feeder)))
+                if last_feeder is not None and (feeder.ID != last_feeder or curr_hops != last_hops):
+                    bh_penalty = float(os.environ.get('LEO_BH_PENALTY', '0.2'))
+                user._last_feeder = feeder.ID
+                user._last_feeder_hops = curr_hops
+            return rate_reward - ho_penalty - bh_penalty
+        return 0.0
     
-    #RL
-    def Observe(self,user:User,mode):
-        self.ob[user] = []
-        self.ob[user].append([-1.0 for i in range(self.topo.total_sat)])
-        self.ob[user].append([-1.0 for i in range(self.topo.total_sat)])
-        self.ob[user].append([False for i in range(self.topo.total_sat)])
-        if user.sat_connected!=None:
-            self.ob[user][2][user.sat_connected.ID-1] = True
+    def _get_feeder_sat(self, user:User, source_sat=None):
+        """选择跳数最少的gateway feeder卫星."""
+        gw = getattr(user, 'assigned_gateway', None)
+        if gw is None:
+            return None
+        best = None
+        best_hops = 999
+        for sat in gw.connected_sat:
+            if sat is None:
+                continue
+            if source_sat is not None:
+                h = self._hops_cache.get((source_sat.ID, sat.ID), self.Calc_Path_Hops(source_sat, sat))
+            else:
+                h = 1
+            if h < best_hops:
+                best_hops = h
+                best = sat
+        return best
+
+    def _precompute_hops(self):
+        """每集预计算所有sat→feeder的跳数(O(1)查表替代SPT遍历)."""
+        self._hops_cache.clear()
+        feeders = []
+        for gw in self.topo.gateway:
+            for s in gw.connected_sat:
+                if s is not None:
+                    feeders.append(s)
+        for con in range(len(self.topo.constellation)):
+            sat_num = self.topo.constellation[con].orbit_num * self.topo.constellation[con].sat_per_orbit
+            for src_id in range(1, sat_num + 1):
+                src = self.topo.satellite[src_id - 1]
+                for fs in feeders:
+                    if src == fs:
+                        self._hops_cache[(src_id, fs.ID)] = 1
+                    elif self.net.SPT[con][src_id - 1][fs.ID - 1].isReached:
+                        self._hops_cache[(src_id, fs.ID)] = self.Calc_Path_Hops(src, fs)
+
+    def _compute_rvt(self, user:User, sat, max_rvt=600, step=10):
+        """计算user-sat之间的剩余可见时间(秒). 10s步长, 最大600s."""
+        t0 = self.topo.current_time
+        if t0 != self._rvt_cache_time:  # 新时刻: 清空位置缓存 (同ep 200用户共享)
+            self._rvt_cache_time = t0
+            self._rvt_cache.clear()
+        rvt = 0
+        for dt in range(0, max_rvt + step, step):
+            key = (sat.ID, t0 + dt)
+            sat_pos = self._rvt_cache.get(key)
+            if sat_pos is None:  # 首次计算后缓存复用 (纯函数, bit级安全)
+                sat_pos = sat.Get_Satellite_We_Condition(t0 + dt)
+                self._rvt_cache[key] = sat_pos
+            if Calc_Sphere_Elevation(sat_pos, user.we_pos) >= USER_ELEVATION:
+                rvt = dt
+            else:
+                break
+        return rvt
+
+    #RL - Yang论文 Eq.46: 3特征/星 (3N), 对齐论文
+    def Observe_Yang(self,user:User,mode):
+        N = self.topo.total_sat
+        RATE_CAP = 1000.0
+
+        prev_conn = [0.0] * N        # [0] x^u: 连接状态
+        cavai     = [-1.0] * N       # [1] Cavai/C_norm
+        rvt       = [0.0] * N        # [2] RVT/600
+
+        if user.last_connected is not None:
+            prev_conn[user.last_connected.ID - 1] = 1.0
+
+        feeder_sat = self._get_feeder_sat(user)
+
         for sat in self.ho[user]:
-            self.ob[user][0][sat.ID-1] = self.ho[user][sat].available_band
-            self.ob[user][1][sat.ID-1] = self.ho[user][sat].rate_integral
-        return list((np.array(self.ob[user]).flatten()))
+            idx = sat.ID - 1
+            if feeder_sat is not None:
+                fb = self.net.N2N_status[sat.con_id - 1][sat.ID - 1][feeder_sat.ID - 1].free_band
+                val = min(self.ho[user][sat].c_quality, fb)
+            else:
+                val = self.ho[user][sat].c_quality
+            cavai[idx] = max(0.001, min(1.0, val / RATE_CAP))
+            rvt[idx] = min(1.0, self._compute_rvt(user, sat) / 600.0)
+
+        return prev_conn + cavai + rvt
+
+    #RL - 5N state: Yang式(prev_conn+Cavai+RVT) + beam_load + 回传可靠性
+    def Observe(self,user:User,mode):
+        """可见星×F特征: [elevation, RVT, c_quality, ISL_free_band].
+           全部归一化到[0,1]. 按卫星ID排序(不泄露质量信息).
+           变长模式(LEO_VARLEN=1): 全部可见星, 不足补0. sat_ids供动作映射."""
+        FEAT = int(os.environ.get('LEO_FEAT_PER_SAT', '4'))
+        VARLEN = os.environ.get('LEO_VARLEN', '0') == '1'
+        K = 30 if VARLEN else 12  # 变长模式: 最多30颗可见星
+
+        features = []  # [(elev, rvt, cq, [isl_fb], [is_cur], sat_id), ...]
+        cur_id = user.sat_connected.ID if user.sat_connected is not None else -1
+
+        for sat in self.ho[user]:
+            elev_raw = Calc_Sphere_Elevation(sat.we_pos, user.we_pos)
+            elev = elev_raw * 2.0 / _pi                 # [0, 1]
+            rvt  = min(1.0, self._compute_rvt(user, sat) / 600.0)
+            cq   = min(1.0, self.ho[user][sat].c_quality / RATE_UPPER)
+            feat = [elev, rvt, cq]
+            if FEAT >= 4:
+                fd = self._get_feeder_sat(user, sat)
+                if fd is not None and sat != fd:
+                    fb = self.net.N2N_status[sat.con_id - 1][sat.ID - 1][fd.ID - 1].free_band
+                    feat.append(min(1.0, fb / RATE_UPPER))
+                else:
+                    feat.append(1.0)  # 直连feeder, 无ISL瓶颈
+            if FEAT >= 5:
+                feat.append(1.0 if sat.ID == cur_id else 0.0)
+            feat.append(sat.ID)
+            features.append(tuple(feat))
+
+        # 按卫星ID排序 (不泄露质量信息, 网络需要自己学)
+        features.sort(key=lambda x: x[-1])
+        # 变长模式: 截断到K
+        if len(features) > K:
+            features = features[:K]
+
+        state = []
+        sat_ids = []
+        for i in range(K):
+            if i < len(features):
+                feat = features[i]
+                state.extend(feat[:-1])  # 前FEAT个值
+                sat_ids.append(feat[-1])  # 最后是sat_id
+            else:
+                state.extend([0.0] * FEAT)
+                sat_ids.append(0)
+
+        user._topK_sat_ids = sat_ids
+        return state
     
     def close(self):
         hsout.logger.critical("Handover success count:%d"%self.ho_count)

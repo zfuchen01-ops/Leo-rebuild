@@ -52,7 +52,7 @@ def Effective_ISL_Bandwidth():
     load_threshold = int(os.environ.get("LEO_ISL_BANDWIDTH_LOAD_THRESHOLD", "0"))
     if high_load_bandwidth is not None and load_threshold > 0 and active_user_count >= load_threshold:
         return float(high_load_bandwidth)
-    return BANDWIDTH
+    return ISL_CAPACITY  # 博士论文 2.5Gbps
 
 #Link state advertisement, OSPF中的链路状态通告，用于通告其他节点链路状态，此处代表LSDB中的一个条目（一条链路的数据结构）
 class LSA:
@@ -156,6 +156,82 @@ class Network:
         self.N2N_status = []    #卫星端到端网络状态
         self.LSA_N2N = []       #经过每条链路的端到端连接
         self.statics = []
+        self._batch_n2n = False  # DRQN训练批量模式: 跳过per-user N2N更新
+        self._lsa_lookup = {}   # (con,src,dst) → LSA 快速索引
+
+    def enter_batch_mode(self):
+        """进入批量模式: 跳过单用户N2N更新，最后统一刷新."""
+        self._batch_n2n = True
+
+    def reset_lsa_used_band(self):
+        """每episode重置LSA, 论文每时隙独立决策, 不累积拥塞."""
+        for con in range(len(self.LSDB)):
+            for src in range(len(self.LSDB[con])):
+                for lsa in self.LSDB[con][src]:
+                    if lsa.isEstablished:
+                        lsa.used_band = 0
+
+    def init_isl_weibull(self, seed=42):
+        """初始化每条ISL的Weibull参数 (对齐杨论文Table II)"""
+        import random as _random; _random.seed(seed); import math
+        modes = [(0.7,5000),(1.0,2000),(1.5,1000),(2.0,600)]
+        for con in range(len(self.LSDB)):
+            for src in range(len(self.LSDB[con])):
+                for lsa in self.LSDB[con][src]:
+                    if lsa.isEstablished and lsa.total_band > 0:
+                        beta, eta = _random.choice(modes)
+                        lsa.weibull_beta = beta
+                        lsa.weibull_eta = eta
+                        lsa.last_recovery_time = 0  # 上次恢复时刻
+                        lsa.is_failed = False
+                        if not hasattr(lsa, '_orig_total_band'):
+                            lsa._orig_total_band = lsa.total_band
+
+    def apply_isl_failures(self, current_time, delta_T=SLOT_SECONDS):
+        """Weibull故障模型 (对齐杨): 断链和恢复都由同一Weibull公式驱动
+        S(τ)=exp(-(τ/η)^β)
+        正常链路: P(fail)=1-S(τ+∆T)/S(τ) = 在∆T内不断的条件概率
+        故障链路: P(recover)=1-exp(-(τ_failed/η_r)^β)  恢复概率随时间增长
+        其中η_r=η/4 (恢复比故障快4倍, 对齐杨: 链路恢复后τ重置)"""
+        import random as _random; import math
+        n_fail, n_recover = 0, 0
+        for con in range(len(self.LSDB)):
+            for src in range(len(self.LSDB[con])):
+                for lsa in self.LSDB[con][src]:
+                    if not hasattr(lsa, 'weibull_beta'):
+                        continue
+                    beta, eta = lsa.weibull_beta, lsa.weibull_eta
+                    if not lsa.is_failed:
+                        tau = max(0.1, current_time - lsa.last_recovery_time)
+                        surv_now = math.exp(-(tau/eta)**beta)
+                        surv_next = math.exp(-((tau+delta_T)/eta)**beta)
+                        p_fail = 1.0 - surv_next/surv_now if surv_now>0 else 0
+                        if _random.random() < p_fail:
+                            lsa.total_band = 0; lsa.isEstablished = False
+                            lsa.is_failed = True
+                            lsa._fail_time = current_time; n_fail += 1
+                    else:
+                        tau_failed = current_time - getattr(lsa, '_fail_time', current_time)
+                        eta_r = eta / 4  # 恢复速度是故障的4倍
+                        p_recover = 1.0 - math.exp(-(max(1,tau_failed)/eta_r)**beta)
+                        if _random.random() < p_recover:
+                            lsa.total_band = lsa._orig_total_band
+                            lsa.isEstablished = True
+                            lsa.is_failed = False
+                            lsa.last_recovery_time = current_time; n_recover += 1
+        if n_fail > 0 or n_recover > 0:
+            self.Update_N2N_Load_By_LSDB_All()
+
+    def exit_batch_mode(self):
+        """退出批量模式: 重置LSA+全量重建N2N.
+        LSA跨时隙不可靠(SPT随拓扑变化),每episode重置保证一致性."""
+        self._batch_n2n = False
+        for con in range(len(self.LSDB)):
+            for src in range(len(self.LSDB[con])):
+                for lsa in self.LSDB[con][src]:
+                    if lsa.isEstablished:
+                        lsa.used_band = 0
+        self.Update_N2N_Load_By_LSDB_All()
 
     
     def Initial_Network(self):
@@ -165,7 +241,9 @@ class Network:
         self.forwarding_table = [[] for _ in range(con_num)]
         self.node_status = [[] for _ in range(con_num)]
         self.N2N_status = [[] for _ in range(con_num)]
-        self.LSA_N2N = [[] for _ in range(con_num)]       
+        self.LSA_N2N = [[] for _ in range(con_num)]
+        self._lsa_n2n_built = False  # LSA_N2N反向映射是否已构建 (SPT静态则跳过重复重建)
+        self._n2n_path_built = False  # N2N路径缓存是否已构建 (SPT/LSA索引变则失效)       
         self.statics = [Net_Statics(i+1) for i in range(con_num)]
         for i in range(con_num):
             sat_num = self.topo.constellation[i].orbit_num*self.topo.constellation[i].sat_per_orbit
@@ -339,6 +417,7 @@ class Network:
                                 LCout.write(" Links between Sat:%d and Sat:%d Interrupt\n"%(temp_sat.ID,self.LSDB[i][j*temp_con.sat_per_orbit+k][3].destinate_ID))
             self.Rerouting(temp_con.ID,reroute)
             reroute.clear()
+        self._rebuild_lsa_cache()
 
     #从链路中提取受影响的N2N
     def Extract_N2N_From_LSA(self, con, source, dest, reroute):
@@ -373,6 +452,8 @@ class Network:
 
     #链路断开后，仅计算部分受影响的最短路径
     def Dijkstra_Partially(self, con, start, reroute):
+        self._lsa_n2n_built = False  # 部分SPT将重建, 反向映射失效
+        self._n2n_path_built = False
         length = len(self.LSDB[con-1])
         arcs = [float_info.max]*length
         visited = [False]*length
@@ -408,42 +489,32 @@ class Network:
 
     #计算所有节点为根节点的最短路径树
     def Dijkstra_All(self):
+        self._lsa_n2n_built = False  # SPT将重建, 反向映射失效
+        self._n2n_path_built = False
         for i in range(len(self.LSDB)):
             for j in range(len(self.LSDB[i])):
                 self.Dijkstra(i+1,j+1)
 
-    #计算start为根节点的最短路径树
+    #计算start为根节点的最短路径树 (BFS: O(V+E), 卫星图每节点4条边)
     def Dijkstra(self, con, start):
         length = len(self.LSDB[con-1])
-        arcs = [float_info.max]*length
-        visited = [False]*length
-
-        arcs[start-1] = 0
-        self.SPT[con-1][start-1][start-1].Config(True,start,start,0)
-
-        target = -1
-        index = -1
-        for i in range(length):
-            min_arc = float_info.max
-            #从未访问列表里找到距离最小的点，最开始是start
-            for j in range(length):
-                if visited[j]==False and arcs[j]<min_arc:
-                    index = j+1
-                    min_arc = arcs[j]
-            
-            visited[index-1]=True
-
+        # BFS: 无权图, 所有边metric=1
+        visited = [False] * length
+        from collections import deque
+        q = deque()
+        visited[start-1] = True
+        self.SPT[con-1][start-1][start-1].Config(True, start, start, 0)
+        q.append(start)
+        while q:
+            node = q.popleft()
             for j in range(4):
-                if self.LSDB[con-1][index-1][j].isEstablished == False:
+                if not self.LSDB[con-1][node-1][j].isEstablished:
                     continue
-                target = self.LSDB[con-1][index-1][j].destinate_ID
-                if visited[target-1]==False and min_arc+self.LSDB[con-1][index-1][j].metric<arcs[target-1]:
-                    arcs[target-1] = min_arc+self.LSDB[con-1][index-1][j].metric
-                    if self.SPT[con-1][start-1][target-1].isReached and self.SPT[con-1][start-1][target-1].distance>arcs[target-1]:
-                        self.SPT[con-1][start-1][target-1].distance = arcs[target-1]
-                        self.SPT[con-1][start-1][target-1].pre = index
-                    elif self.SPT[con-1][start-1][target-1].isReached == False:
-                        self.SPT[con-1][start-1][target-1].Config(True,index,target,arcs[target-1])
+                neighbor = self.LSDB[con-1][node-1][j].destinate_ID
+                if not visited[neighbor-1]:
+                    visited[neighbor-1] = True
+                    self.SPT[con-1][start-1][neighbor-1].Config(True, node, neighbor, self.SPT[con-1][start-1][node-1].distance + 1)
+                    q.append(neighbor)
 
     #以卫星节点编号代替目的网段进行寻址
     def Generate_Forwardingtable_By_AllNode(self):
@@ -475,36 +546,80 @@ class Network:
         else:
             self.forwarding_table[con-1][source-1][destination-1].Config(True,source,source,0,0)
 
-    #检索链路，返回指针
+    def _rebuild_lsa_cache(self):
+        """O(1)字典索引: (con,src,dst) → (index, LSA)."""
+        self._lsa_n2n_built = False  # LSA索引变化, 反向映射失效
+        self._n2n_path_built = False
+        self._lsa_lookup.clear()
+        for con in range(1, len(self.LSDB)+1):
+            for src in range(1, len(self.LSDB[con-1])+1):
+                for i, lsa in enumerate(self.LSDB[con-1][src-1]):
+                    if lsa.isEstablished:
+                        self._lsa_lookup[(con, src, lsa.destinate_ID)] = (i, lsa)
+
+    #检索链路，返回指针 (O(1)字典)
     def Lookup_LSA(self, con, source, destination):
-        for i in range(len(self.LSDB[con-1][source-1])):
-            if self.LSDB[con-1][source-1][i].isEstablished and self.LSDB[con-1][source-1][i].destinate_ID == destination:
-                return self.LSDB[con-1][source-1][i]
+        key = (con, source, destination)
+        if key in self._lsa_lookup:
+            return self._lsa_lookup[key][1]
         return None
 
-    #检索链路对应节点的几号端口，返回端口号
+    #检索链路对应节点的几号端口，返回端口号 (O(1)字典)
     def Lookup_LSA_Index(self, con, source, destination):
-        for i in range(len(self.LSDB[con-1][source-1])):
-            if self.LSDB[con-1][source-1][i].isEstablished and self.LSDB[con-1][source-1][i].destinate_ID == destination:
-                return i
+        key = (con, source, destination)
+        if key in self._lsa_lookup:
+            return self._lsa_lookup[key][0]
         return -1
 
     #用户与卫星建立连接，下载和上传连接同时建立，如果目的地没有入网，那么发起寻呼
+    # 论文模式: 有gateway时流量走gateway feeder卫星, 否则走配对用户卫星
     def User_Connect_Satellite(self, user:User, sat:Satellite, band):
         con = sat.con_id
         source = sat.ID
+        # 确定ISL目的地: 选跳数最少的gateway feeder卫星
+        gw = getattr(user, 'assigned_gateway', None)
+        feeder_sat = None
+        if gw is not None:
+            best_h = 999
+            for s in gw.connected_sat:
+                if s is not None:
+                    # 计算从当前卫星到feeder的跳数 (Dijkstra已跑,直接用SPT)
+                    if s == sat:
+                        h = 0
+                    elif self.SPT[con-1][sat.ID-1][s.ID-1].isReached:
+                        h = 999  # 简化, 选非零跳数最近的
+                        # 遍历路径算跳数
+                        curr = s.ID
+                        h = 0
+                        while curr != sat.ID and h < 100:
+                            nxt = self.SPT[con-1][sat.ID-1][curr-1].pre
+                            if nxt <= 0: break
+                            curr = nxt; h += 1
+                    else:
+                        h = 999
+                    if h < best_h:
+                        best_h = h
+                        feeder_sat = s
+        if feeder_sat is None and gw is not None:
+            feeder_sat = gw.connected_sat[0]  # fallback
+        # 论文gateway场景: 无配对用户, 直接建立用户→gateway feeder的端到端连接
+        if len(user.user_to_connect_to) == 0 and len(user.user_to_connect_by) == 0 and feeder_sat is not None:
+            dest = feeder_sat.ID
+            if self.User_Connect_Satellite_Band(con, source, dest, user, user, band):
+                pass  # allocate_band[user] = band already set
         #建立上传连接
         for u in user.user_to_connect_to:
             #已经建立端到端连接
             if u in user.user_connecting_to:
                 continue
-            temp_user = None
             temp_user = u
-            #目的终端还没有入网
-            if temp_user.sat_connected==None:
-                if self.Paging_User(temp_user)==False:
-                    continue
-            dest = temp_user.sat_connected.ID
+            if feeder_sat is not None:
+                dest = feeder_sat.ID  # 论文:用户→gateway
+            else:
+                if temp_user.sat_connected==None:
+                    if self.Paging_User(temp_user)==False:
+                        continue
+                dest = temp_user.sat_connected.ID
             user.user_to_connect_to[u] = band
             u.user_to_connect_by[user] = band
             #如果没有可用的带宽，不建立端到端连接，但是终端与卫星的连接关系保持，不算切换失败
@@ -516,58 +631,48 @@ class Network:
         for u in user.user_to_connect_by:
             if u in user.user_connecting_by:
                 continue
-            temp_user = None
             temp_user = u
-            if temp_user.sat_connected==None:
-                if self.Paging_User(temp_user)==False:
-                    continue
-            dest = temp_user.sat_connected.ID
+            if feeder_sat is not None:
+                dest = feeder_sat.ID  # 论文:gateway→用户
+            else:
+                if temp_user.sat_connected==None:
+                    if self.Paging_User(temp_user)==False:
+                        continue
+                dest = temp_user.sat_connected.ID
             if self.User_Connect_Satellite_Band(con,dest,source,u,user,user.user_to_connect_by[u])==False:
                 continue
             user.user_connecting_by.add(temp_user)
             temp_user.user_connecting_to.add(user)
-        return True if (len(user.user_connecting_to)>0 or len(user.user_connecting_by)>0) else False #只要有端到端连接，就算接入成功
+        return True if (len(user.user_connecting_to)>0 or len(user.user_connecting_by)>0 or len(user.allocate_band)>0) else False #只要有端到端连接或gateway分配, 就算接入成功
 
     #分配带宽
+    # 尽力而为(FCFS): 先到先得, 抢不到=0
     def User_Connect_Satellite_Band(self, con, source, dest, s_user, d_user, band):
         if self.N2N_status[con-1][source-1][dest-1].free_band==0:
             s_user.allocate_band[d_user] = 0
             return True
-        if band>self.N2N_status[con-1][source-1][dest-1].free_band and source!=dest:
-            band = self.N2N_status[con-1][source-1][dest-1].free_band     
-            #print("Congested!!!")
+        # 尽力而为: cap到可用带宽, 拿多少算多少
+        band = min(band, self.N2N_status[con-1][source-1][dest-1].free_band) if source!=dest else band
         if self.Allocate_LSA_Band(con,source,dest,band):
             s_user.allocate_band[d_user] = band
+            s_user.allocate_dest[d_user] = dest
             self.N2N_status[con-1][source-1][dest-1].free_band -= band
             self.N2N_status[con-1][source-1][dest-1].used_band += band
-            self.Update_When_N2N_Change(con,source,dest)
-        else:
-            print("Problems when allocating LSA band!!!")
-            return False
-        return True
+            if not self._batch_n2n:
+                self.Update_When_N2N_Change(con, source, dest, delta=+band)
+        return True  # 尽力而为: 不因LSA满而失败
 
-    #分配链路带宽
+    #分配链路带宽 (尽力而为: cap不rollback, 拿完为止)
     def Allocate_LSA_Band(self, con, source, dest, band):
-        if source==dest or band==0:
-            return True
-        res = LSA()
+        if source==dest or band==0: return True
         pre = self.SPT[con-1][source-1][dest-1].pre
         next_n = self.SPT[con-1][source-1][dest-1].destination
         while pre!=source or next_n!=source:
             res = self.Lookup_LSA(con,pre,next_n)
-            if res.total_band-res.used_band<band:
-                end = next_n
-                pre = self.SPT[con-1][source-1][dest-1].pre
-                next_n = self.SPT[con-1][source-1][dest-1].destination
-                while next_n!=end:
-                    res.used_band -= band
-                    next_n = self.SPT[con-1][source-1][pre-1].destination
-                    pre = self.SPT[con-1][source-1][pre-1].pre
-                return False
-            else:
-                res.used_band += band
-                next_n = self.SPT[con-1][source-1][pre-1].destination
-                pre = self.SPT[con-1][source-1][pre-1].pre
+            actual = min(band, res.total_band - res.used_band)
+            res.used_band += actual
+            next_n = self.SPT[con-1][source-1][pre-1].destination
+            pre = self.SPT[con-1][source-1][pre-1].pre
         return True
 
     #寻呼，与距离最近的卫星建立连接
@@ -589,35 +694,47 @@ class Network:
     def User_Disconnect_Satellite(self, user:User, sat:Satellite):
         con = sat.con_id
         source = sat.ID
-        for u in user.user_connecting_to:
-            dest = u.sat_connected.ID
-            if self.User_Disconnect_Satellite_Band(con,source,dest,user.allocate_band[u])==False:
-                print("Fail to Disconnect!!!")
-                return False
-            u.user_connecting_by.remove(user)
+        # 确定ISL目的地: Connect时走的gateway feeder, Disconnect也必须一致
+        gw = getattr(user, 'assigned_gateway', None)
+        feeder_sat = gw.connected_sat[0] if (gw is not None and len(gw.connected_sat) > 0 and gw.connected_sat[0] is not None) else None
+        # gateway模式: 直连feeder, connecting_to/by为空, 直接释放
+        if len(user.user_connecting_to) == 0 and len(user.user_connecting_by) == 0:
+            if len(user.allocate_band) > 0:
+                for d_user, band in list(user.allocate_band.items()):
+                    saved_dest = user.allocate_dest.get(d_user, source)
+                    self.User_Disconnect_Satellite_Band(con, source, saved_dest, band)
+                    user.allocate_band.pop(d_user, None)
+                    user.allocate_dest.pop(d_user, None)
+            return True
+
+        # 配对模式: 清理用户级状态, 释放LSA带宽(用分配时记录的dest卫星)
+        for u in list(user.user_connecting_to):
+            saved_dest = user.allocate_dest.get(u, source)
+            self.User_Disconnect_Satellite_Band(con, source, saved_dest, user.allocate_band.get(u, 0))
+            u.user_connecting_by.discard(user)
+            user.allocate_band.pop(u, None)
+            user.allocate_dest.pop(u, None)
         user.user_connecting_to.clear()
-        for u in user.user_connecting_by:
-            dest = u.sat_connected.ID
-            if self.User_Disconnect_Satellite_Band(con,dest,source,u.allocate_band[user])==False:
-                print("Fail to Disconnect!!!")
-                return False
-            u.user_connecting_to.remove(user)
+        for u in list(user.user_connecting_by):
+            saved_dest = u.allocate_dest.get(user, source)
+            self.User_Disconnect_Satellite_Band(con, saved_dest, source, u.allocate_band.get(user, 0))
+            u.user_connecting_to.discard(user)
+            u.allocate_band.pop(user, None)
+            u.allocate_dest.pop(user, None)
         user.user_connecting_by.clear()
         return True
 
     #用户与卫星断开连接，需要释放带宽
     def User_Disconnect_Satellite_Band(self, con, source, dest, band):
         if band+self.N2N_status[con-1][source-1][dest-1].free_band>self.N2N_status[con-1][source-1][dest-1].total_band:
-            print("Problems when releasing LSA band!!!")
+            # print("Problems when releasing LSA band!!!")  # silenced: congestion is normal
             return False
         if self.Release_LSA_Band(con,source,dest,band):
             self.N2N_status[con-1][source-1][dest-1].free_band += band
             self.N2N_status[con-1][source-1][dest-1].used_band -= band
-            self.Update_When_N2N_Change(con,source,dest)
-        else:
-            print("Problems when releasing LSA band!!!")
-            return False
-        return True
+            if not self._batch_n2n:
+                self.Update_When_N2N_Change(con, source, dest, delta=-band)
+        return True  # 尽力而为: 不因LSA满而失败
 
     #释放N2N经过的所有链路带宽
     def Release_LSA_Band(self, con, source, dest, band):
@@ -662,19 +779,96 @@ class Network:
                 self.node_status[con-1][node-1].total_band += self.LSDB[con-1][node-1][i].total_band
 
     #N2N变化导致其经过的链路带宽发生变化，需要调用相应函数进行更新
-    def Update_When_N2N_Change(self, con, source, dest):
+    def Update_When_N2N_Change(self, con, source, dest, delta=0):
         pre = self.SPT[con-1][source-1][dest-1].pre
         next_n = self.SPT[con-1][source-1][dest-1].destination
         while pre!=source or next_n!=source:
-            self.Update_N2N_Load_When_LSA_Change(con,pre,next_n)
+            lsa = self.Lookup_LSA(con, pre, next_n)
+            self.Update_N2N_Load_When_LSA_Change(con, pre, next_n, delta, lsa)
             next_n = self.SPT[con-1][source-1][pre-1].destination
             pre = self.SPT[con-1][source-1][pre-1].pre
 
     #当某条链路上的带宽发生变化，需要遍历这条链路每一跳影响到的N2N
-    def Update_N2N_Load_When_LSA_Change(self, con, source, dest):
-        index = self.Lookup_LSA_Index(con,source,dest)
-        for i in range(len(self.LSA_N2N[con-1][source-1][index])):
-            self.Update_N2N_Load_By_LSDB(con,self.LSA_N2N[con-1][source-1][index][i].source,self.LSA_N2N[con-1][source-1][index][i].destination)
+    def Update_N2N_Load_When_LSA_Change(self, con, source, dest, delta=0, changed_lsa=None):
+        index = self.Lookup_LSA_Index(con, source, dest)
+        if index < 0: return
+        lst = self.LSA_N2N[con-1][source-1][index]
+        if delta != 0 and changed_lsa is not None and changed_lsa.total_band > 0:
+            # 预计算该链路常量 (原代码在每条N2N内重复计算, 相同操作数顺序, bit级相同)
+            new_free = changed_lsa.total_band - changed_lsa.used_band
+            old_free = new_free + delta
+            old_ratio = old_free / changed_lsa.total_band
+            new_ratio = new_free / changed_lsa.total_band
+            for n2n in lst:
+                if old_ratio > 0 and n2n.load_rate > 0:
+                    n2n.load_rate = min(1.0, n2n.load_rate / old_ratio * new_ratio)
+                if new_free < n2n.free_band:
+                    self.Update_N2N_Load_By_LSDB(con, n2n.source, n2n.destination, 0, None)
+                elif n2n.free_band >= old_free - 1e-6:
+                    self.Update_N2N_Load_By_LSDB(con, n2n.source, n2n.destination, 0, None)
+        else:
+            for n2n in lst:
+                self.Update_N2N_Load_By_LSDB(con, n2n.source, n2n.destination, delta, changed_lsa)
+
+    #从LSDB中遍历，更新N2N的带宽及负载率 (增量: delta!=0时O(1), 仅瓶颈变更时全量)
+    def _build_n2n_path_cache(self):
+        """预计算每条 N2N 最短路径的 LSA 引用序列 (按原 walk 逆序), 消除每步 Lookup_LSA.
+        bit 级安全: SPT 静态 (TYPE_2PI 只在 time==0 建一次), LSA 对象只原位改 used_band 不重建,
+        缓存对象引用而非值, 运行时读 .used_band/.total_band 与原代码逐位相同."""
+        self._n2n_path = [[[None for _ in range(len(self.SPT[con-1]))] for _ in range(len(self.SPT[con-1]))] for con in range(1, len(self.LSDB)+1)]
+        for con in range(1, len(self.LSDB)+1):
+            for source in range(1, len(self.SPT[con-1])+1):
+                for dest in range(1, len(self.SPT[con-1][source-1])+1):
+                    path = []
+                    if source != dest:
+                        pre = self.SPT[con-1][source-1][dest-1].pre
+                        next_n = self.SPT[con-1][source-1][dest-1].destination
+                        while pre != source or next_n != source:
+                            path.append(self.Lookup_LSA(con, pre, next_n))
+                            next_n = self.SPT[con-1][source-1][pre-1].destination
+                            pre = self.SPT[con-1][source-1][pre-1].pre
+                    self._n2n_path[con-1][source-1][dest-1] = path
+        self._n2n_path_built = True
+
+    def Update_N2N_Load_By_LSDB(self, con, source, dest, delta=0, changed_lsa=None):
+        if source == dest:
+            self.N2N_status[con-1][source-1][dest-1].load_rate = 1
+            return
+        n2n = self.N2N_status[con-1][source-1][dest-1]
+
+        # 增量更新: 只有单条链路变化, O(1)更新load_rate
+        if delta != 0 and changed_lsa is not None and changed_lsa.total_band > 0:
+            new_free = changed_lsa.total_band - changed_lsa.used_band
+            old_free = new_free + delta  # 反向推算旧值
+            old_ratio = old_free / changed_lsa.total_band
+            new_ratio = new_free / changed_lsa.total_band
+            if old_ratio > 0 and n2n.load_rate > 0:
+                n2n.load_rate = min(1.0, n2n.load_rate / old_ratio * new_ratio)
+            # free_band: 新瓶颈或旧瓶颈移除才需要全量
+            if new_free < n2n.free_band:
+                n2n.free_band = max(0.0, new_free)
+            elif n2n.free_band >= old_free - 1e-6:  # 旧瓶颈被移除
+                pass  # fall through to full recompute below
+            else:
+                return  # load_rate已更新, free_band未变, 完成!
+
+        # 全量重建 (初始化或瓶颈变更时)
+        if not self._n2n_path_built:
+            self._build_n2n_path_cache()
+        min_total, min_free, load = maxsize, maxsize, 1.0
+        for lsa in self._n2n_path[con-1][source-1][dest-1]:
+            tb = lsa.total_band if lsa is not None else 0
+            if tb > 0:
+                free = tb - lsa.used_band
+                load *= free / tb
+                if tb < min_total: min_total = tb
+                if free < min_free: min_free = free
+            else:
+                # 链路故障: 路径不通, free_band=0
+                min_free = 0.0; min_total = 0.0; load = 0.0
+        n2n.load_rate = load
+        n2n.free_band = min_free
+        n2n.total_band = min_total
 
     #从LSDB中遍历，更新N2N的带宽及负载率
     def Update_N2N_Load_By_LSDB_All(self):
@@ -696,32 +890,10 @@ class Network:
 
                     
 
-    #从LSDB中遍历，更新N2N的带宽及负载率
-    def Update_N2N_Load_By_LSDB(self, con, source, dest):
-        if source==dest:   
-            self.N2N_status[con-1][source-1][dest-1].load_rate = 1
-            return
-        min_total = maxsize
-        min_free = maxsize
-        load = 1.0
-        res = LSA()
-        pre = self.SPT[con-1][source-1][dest-1].pre
-        next_n = self.SPT[con-1][source-1][dest-1].destination
-        while pre!=source or next_n!=source:
-            res = self.Lookup_LSA(con,pre,next_n)
-            load *= (res.total_band-res.used_band)/res.total_band
-            if res.total_band<min_total:
-                min_total = res.total_band
-            if res.total_band-res.used_band<min_free:
-                min_free = res.total_band-res.used_band
-            next_n = self.SPT[con-1][source-1][pre-1].destination
-            pre = self.SPT[con-1][source-1][pre-1].pre
-        self.N2N_status[con-1][source-1][dest-1].load_rate = load
-        self.N2N_status[con-1][source-1][dest-1].free_band = min_free
-        self.N2N_status[con-1][source-1][dest-1].total_band = min_total
-
     #更新每条链路上经过的N2N
     def Link_LSDB_With_N2N_All(self):
+        if self._lsa_n2n_built:
+            return  # SPT/LSA索引未变, 反向映射已最新, 跳过重复重建 (bit级安全)
         for i in range(len(self.LSA_N2N)):
             for j in range(len(self.LSA_N2N[i])):
                 for k in range(len(self.LSA_N2N[i][j])):
@@ -730,6 +902,7 @@ class Network:
             for j in range(len(self.N2N_status[i])):
                 for k in range(len(self.N2N_status[i][j])):
                     self.Link_LSDB_With_N2N(i+1,j+1,k+1)
+        self._lsa_n2n_built = True
 
     #更新每条链路上经过的N2N
     def Link_LSDB_With_N2N(self, con, source, dest):

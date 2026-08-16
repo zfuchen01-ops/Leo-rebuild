@@ -155,17 +155,22 @@ class Topology:
                             gw.sat_covered.add(sat)
 
     def update_feederlink(self):
-        """地面站馈电链路切换: 每次选择剩余可见时长最大的卫星 (博士论文策略)"""
+        """地面站馈电链路切换: 每次选择剩余可见时长最大的卫星 (博士论文策略)
+        同一地面站的多根天线不会连接到同一颗卫星."""
         for gw in self.gateway:
+            used_sats = set()  # 本地面站已分配的卫星
             for ant in range(gw.antenna_Num):
-                # 若当前卫星仍在覆盖范围内则保持不变
                 curr = gw.connected_sat[ant]
-                if curr is not None and curr in gw.sat_covered:
+                # 若当前卫星仍在覆盖范围内且未被其他天线占用, 保持不变
+                if curr is not None and curr in gw.sat_covered and curr not in used_sats:
+                    used_sats.add(curr)
                     continue
-                # 否则选剩余服务时间最长的可见卫星
+                # 否则选剩余服务时间最长的可见卫星 (排除已分配)
                 best_sat = None
                 best_time = -1.0
                 for sat in gw.sat_covered:
+                    if sat in used_sats:
+                        continue
                     s_time = self._calc_service_time(sat, gw)
                     if s_time > best_time:
                         best_time = s_time
@@ -176,6 +181,7 @@ class Topology:
                 # 建立新连接
                 if best_sat is not None:
                     best_sat.connected_gateway.append(gw)
+                    used_sats.add(best_sat)
                 gw.connected_sat[ant] = best_sat
 
     def _calc_service_time(self, sat, gw):
