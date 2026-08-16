@@ -1,6 +1,12 @@
+log/
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
-log/*.log
-results/test_*
+*.pkl
+*.csv
+*.pt
+*.pth
+*.bak
+*.abcd
+*.abcde
+*.b64
+nohup.out

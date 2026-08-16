@@ -235,6 +235,17 @@ class PaperRebuildHandover(Handover):
     def Calc_Available_Band(self, s, u):
         total = 0.0
         count = 0
+
+        # 论文gateway场景: 无配对用户, 直连feeder
+        gw = getattr(u, 'assigned_gateway', None)
+        feeder_sat = gw.connected_sat[0] if (gw is not None and len(gw.connected_sat) > 0 and gw.connected_sat[0] is not None) else None
+        if len(u.user_to_connect_to) == 0 and len(u.user_to_connect_by) == 0 and feeder_sat is not None:
+            if s == feeder_sat:
+                return 0.0  # direct path quality is best
+            elif self.net.SPT[s.con_id-1][s.ID-1][feeder_sat.ID-1].isReached:
+                return self.net.N2N_status[s.con_id-1][s.ID-1][feeder_sat.ID-1].load_rate
+            return 0.0
+
         for user in u.user_to_connect_to:
             if user.sat_connected is not None:
                 total += self.Calc_Path_Quality_Product(s, user.sat_connected)
